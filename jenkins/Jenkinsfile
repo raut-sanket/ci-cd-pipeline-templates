@@ -1,0 +1,195 @@
+// Jenkinsfile — Declarative Pipeline for Build & Deploy to Kubernetes
+// Requirements: Docker Pipeline plugin, Kubernetes CLI plugin, Credentials plugin
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+                apiVersion: v1
+                kind: Pod
+                spec:
+                  containers:
+                  - name: node
+                    image: node:20-alpine
+                    command: ['sleep', '3600']
+                  - name: docker
+                    image: docker:24-dind
+                    securityContext:
+                      privileged: true
+                    env:
+                    - name: DOCKER_TLS_CERTDIR
+                      value: ""
+                  - name: kubectl
+                    image: bitnami/kubectl:latest
+                    command: ['sleep', '3600']
+            '''
+        }
+    }
+
+    environment {
+        REGISTRY        = 'us-east4-docker.pkg.dev'
+        GCP_PROJECT     = credentials('gcp-project-id')
+        IMAGE           = "${REGISTRY}/${GCP_PROJECT}/suidex-docker/${env.JOB_BASE_NAME}"
+        GKE_CLUSTER     = 'suidex-cluster'
+        GKE_REGION      = 'us-east4'
+        NAMESPACE        = 'production'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.GIT_COMMIT_SHORT}-${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Install & Lint') {
+            steps {
+                container('node') {
+                    sh '''
+                        npm ci
+                        npm run lint
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                container('node') {
+                    sh 'npm test -- --coverage --ci'
+                }
+            }
+            post {
+                always {
+                    junit 'junit.xml'
+                    publishHTML([
+                        allowMissing: true,
+                        reportDir: 'coverage/lcov-report',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('docker') {
+                    withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GCP_KEY')]) {
+                        sh """
+                            cat \$GCP_KEY | docker login -u _json_key --password-stdin https://${REGISTRY}
+
+                            docker build \\
+                                --tag ${IMAGE}:${IMAGE_TAG} \\
+                                --tag ${IMAGE}:latest \\
+                                --label "git.commit=${GIT_COMMIT}" \\
+                                --label "build.number=${BUILD_NUMBER}" \\
+                                .
+
+                            docker push ${IMAGE}:${IMAGE_TAG}
+                            docker push ${IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('docker') {
+                    sh """
+                        docker run --rm \\
+                            -v /var/run/docker.sock:/var/run/docker.sock \\
+                            aquasec/trivy:latest image \\
+                            --exit-code 0 \\
+                            --severity CRITICAL,HIGH \\
+                            ${IMAGE}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('kubectl') {
+                    withCredentials([file(credentialsId: 'gke-kubeconfig', variable: 'KUBECONFIG')]) {
+                        sh """
+                            kubectl set image deployment/${env.JOB_BASE_NAME} \\
+                                ${env.JOB_BASE_NAME}=${IMAGE}:${IMAGE_TAG} \\
+                                -n staging
+
+                            kubectl rollout status deployment/${env.JOB_BASE_NAME} \\
+                                -n staging --timeout=300s
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                branch 'main'
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: 'Deploy to production?', ok: 'Deploy'
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('kubectl') {
+                    withCredentials([file(credentialsId: 'gke-kubeconfig', variable: 'KUBECONFIG')]) {
+                        sh """
+                            kubectl set image deployment/${env.JOB_BASE_NAME} \\
+                                ${env.JOB_BASE_NAME}=${IMAGE}:${IMAGE_TAG} \\
+                                -n ${NAMESPACE}
+
+                            kubectl rollout status deployment/${env.JOB_BASE_NAME} \\
+                                -n ${NAMESPACE} --timeout=300s
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            container('kubectl') {
+                withCredentials([file(credentialsId: 'gke-kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh """
+                        echo "Rolling back deployment..."
+                        kubectl rollout undo deployment/${env.JOB_BASE_NAME} -n ${NAMESPACE} || true
+                    """
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

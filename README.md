@@ -1,6 +1,6 @@
 # CI/CD Pipeline Templates
 
-Production-ready CI/CD pipeline templates for **GitLab CI** and **GitHub Actions**. Covers Docker image builds with multi-stage Dockerfiles, Helm chart deployments to Kubernetes, automated testing, security scanning, and ArgoCD sync triggers. Based on real pipelines deploying 15 microservices to GKE.
+Production-ready CI/CD pipeline templates for **GitHub Actions**, **GitLab CI**, and **Jenkins**. Covers Docker image builds, Kubernetes deployments, Terraform automation, security scanning, and auto-rollback. Based on real pipelines deploying 15 microservices to GKE.
 
 ---
 

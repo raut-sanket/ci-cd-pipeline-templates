@@ -1,0 +1,155 @@
+# GitLab CI/CD: Build, Test, Deploy to GKE
+# Multi-stage pipeline with Docker-in-Docker build
+
+stages:
+  - test
+  - security
+  - build
+  - deploy-staging
+  - deploy-production
+
+variables:
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  REGISTRY: us-east4-docker.pkg.dev
+  IMAGE: ${REGISTRY}/${GCP_PROJECT}/suidex-docker/${CI_PROJECT_NAME}
+  KUBE_NAMESPACE_STAGING: staging
+  KUBE_NAMESPACE_PRODUCTION: production
+
+# ─── Cache ────────────────────────────────────────────────────
+.node-cache: &node-cache
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-node
+    paths:
+      - node_modules/
+      - .npm/
+
+# ─── Test Stage ───────────────────────────────────────────────
+lint:
+  stage: test
+  image: node:20-alpine
+  <<: *node-cache
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+test:
+  stage: test
+  image: node:20-alpine
+  <<: *node-cache
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm test -- --coverage
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ─── Security ────────────────────────────────────────────────
+trivy-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy fs --exit-code 1 --severity CRITICAL,HIGH .
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ─── Build ────────────────────────────────────────────────────
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "${GCP_SA_KEY}" | docker login -u _json_key --password-stdin https://${REGISTRY}
+  script:
+    - docker build
+        --cache-from ${IMAGE}:latest
+        --tag ${IMAGE}:${CI_COMMIT_SHA}
+        --tag ${IMAGE}:${CI_COMMIT_REF_SLUG}
+        --tag ${IMAGE}:latest
+        --label "git.commit=${CI_COMMIT_SHA}"
+        --label "git.branch=${CI_COMMIT_REF_NAME}"
+        .
+    - docker push ${IMAGE}:${CI_COMMIT_SHA}
+    - docker push ${IMAGE}:${CI_COMMIT_REF_SLUG}
+    - docker push ${IMAGE}:latest
+    # Scan the built image
+    - docker run --rm
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image
+        --exit-code 0 --severity CRITICAL
+        ${IMAGE}:${CI_COMMIT_SHA}
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ─── Deploy Staging ──────────────────────────────────────────
+deploy-staging:
+  stage: deploy-staging
+  image: google/cloud-sdk:alpine
+  environment:
+    name: staging
+    url: https://staging.suidex.io
+  before_script:
+    - echo "${GCP_SA_KEY}" | gcloud auth activate-service-account --key-file=-
+    - gcloud container clusters get-credentials ${GKE_CLUSTER} --region ${GKE_REGION} --project ${GCP_PROJECT}
+  script:
+    - kubectl set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}=${IMAGE}:${CI_COMMIT_SHA}
+        -n ${KUBE_NAMESPACE_STAGING}
+    - kubectl rollout status deployment/${CI_PROJECT_NAME}
+        -n ${KUBE_NAMESPACE_STAGING} --timeout=300s
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ─── Deploy Production ──────────────────────────────────────
+deploy-production:
+  stage: deploy-production
+  image: google/cloud-sdk:alpine
+  environment:
+    name: production
+    url: https://app.suidex.io
+  before_script:
+    - echo "${GCP_SA_KEY}" | gcloud auth activate-service-account --key-file=-
+    - gcloud container clusters get-credentials ${GKE_CLUSTER} --region ${GKE_REGION} --project ${GCP_PROJECT}
+  script:
+    - kubectl set image deployment/${CI_PROJECT_NAME}
+        ${CI_PROJECT_NAME}=${IMAGE}:${CI_COMMIT_SHA}
+        -n ${KUBE_NAMESPACE_PRODUCTION}
+    - kubectl rollout status deployment/${CI_PROJECT_NAME}
+        -n ${KUBE_NAMESPACE_PRODUCTION} --timeout=300s
+    # Post-deploy health check
+    - |
+      for i in $(seq 1 5); do
+        STATUS=$(kubectl get deployment/${CI_PROJECT_NAME} -n ${KUBE_NAMESPACE_PRODUCTION} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+        if [ "$STATUS" = "True" ]; then
+          echo "Deployment healthy"
+          exit 0
+        fi
+        echo "Waiting for healthy deployment... ($i/5)"
+        sleep 10
+      done
+      echo "Health check failed"
+      kubectl rollout undo deployment/${CI_PROJECT_NAME} -n ${KUBE_NAMESPACE_PRODUCTION}
+      exit 1
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  needs:
+    - deploy-staging
